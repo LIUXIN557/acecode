@@ -39,8 +39,11 @@ TARGETS=(
 # must never be cleaned out by this script. Key = target dir, value = space
 # separated skill names. Any skill listed here is left untouched on that
 # target even though it does not come from .agents/skills.
+#
+# .agents/skills is now the single source for ALL skills, so this is empty by
+# default. Add an entry here only if a given agent keeps a private skill that
+# should not be synced/cleaned.
 declare -A PRESERVE
-PRESERVE[".acecode/skills"]="acecode-release"
 
 DRY_RUN=0
 FORCE=0
