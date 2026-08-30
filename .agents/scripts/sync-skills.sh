@@ -8,11 +8,25 @@
 # whole skill distribution travels with the repo. Run it on any checkout
 # (or CI/bootstrap step) to propagate skills to each configured agent.
 #
+# Conflict handling:
+#   A "conflict" is a skill that exists in a target dir but NOT in the
+#   source (it would otherwise be deleted). When one or more conflicts are
+#   found, the script stops and asks the operator to pick ONE action for the
+#   whole batch:
+#     overwrite  -> delete the conflicting skills from that target
+#     absorb     -> copy the conflicting skill into .agents/skills (new
+#                   authority), then distribute it to every target
+#     cancel     -> do nothing, leave everything untouched (default)
+#
+# In a non-interactive environment (no TTY) the default is "cancel", so it
+# is safe to run in CI. Pass --yes to force "overwrite" without prompting.
+#
 # Usage:
 #   .agents/scripts/sync-skills.sh                 # sync all configured targets
 #   .agents/scripts/sync-skills.sh --dry-run       # preview without writing
-#   .agents/scripts/sync-skills.sh --targets a,b,c # override target list
-#   .agents/scripts/sync-skills.sh --force         # also clean stale skills
+#   .agents/scripts/sync-skills.sh --targets=a,b,c # override target list
+#   .agents/scripts/sync-skills.sh --force         # create missing targets
+#   .agents/scripts/sync-skills.sh --yes           # auto-overwrite conflicts
 #
 set -euo pipefail
 
@@ -36,36 +50,43 @@ TARGETS=(
 )
 
 # Skills that exist ONLY inside a specific target (not in the source) and
-# must never be cleaned out by this script. Key = target dir, value = space
-# separated skill names. Any skill listed here is left untouched on that
-# target even though it does not come from .agents/skills.
-#
-# .agents/skills is now the single source for ALL skills, so this is empty by
-# default. Add an entry here only if a given agent keeps a private skill that
-# should not be synced/cleaned.
+# must be treated as "preserved" (never listed as a conflict, never cleaned).
+# Key = target dir (caller-provided relative form), value = space separated
+# skill names. Usually empty: .agents/skills is the single source of truth.
 declare -A PRESERVE
 
 DRY_RUN=0
 FORCE=0
+YES=0
 TARGET_OVERRIDE=""
 
 usage() {
-  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '2,29p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=1 ;;
     --force)   FORCE=1 ;;
+    --yes)     YES=1 ;;
     --targets=*) TARGET_OVERRIDE="${arg#*=}" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-if [ -n "$TARGET_OVERRIDE" ]; then
-  IFS=',' read -r -a TARGETS <<< "$TARGET_OVERRIDE"
-fi
+is_tty() { [ -t 0 ] && [ -t 1 ]; }
+
+abs_target() {
+  local t="$1"
+  if [[ "$t" == ./* ]] || [[ "$t" != /* ]]; then
+    printf '%s' "${REPO_ROOT}/${t}"
+  else
+    printf '%s' "$t"
+  fi
+}
+
+log() { printf '%s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 if [ ! -d "$SOURCE_DIR" ]; then
@@ -77,90 +98,179 @@ fi
 declare -A SKILLS
 for skill_dir in "${SOURCE_DIR}"/*/; do
   [ -d "$skill_dir" ] || continue
-  skill="$(basename "$skill_dir")"
-  SKILLS["$skill"]="$skill_dir"
+  SKILLS["$(basename "$skill_dir")"]="$skill_dir"
 done
 
-log() { printf '%s\n' "$*"; }
+if [ -n "$TARGET_OVERRIDE" ]; then
+  IFS=',' read -r -a TARGETS <<< "$TARGET_OVERRIDE"
+fi
 
-sync_target() {
-  local target="$1"
-  local rel_key="$1"   # keep the caller-provided form (relative) to match PRESERVE
+# ---------------------------------------------------------------------------
+# Environment for the sync.
+# kind: sync -> reachable copy sync
+# kind: dry  -> report only
+env_kind="sync"
+if [ "$DRY_RUN" -eq 1 ]; then
+  env_kind="dry"
+fi
 
-  if [[ "$target" == ./* ]] || [[ "$target" != /* ]]; then
-    target="${REPO_ROOT}/${target}"
+copy_one() { # src dst  -> copies ensuring dst==src
+  local src="$1" dst="$2"
+  if [ "$env_kind" = "dry" ]; then
+    log "  (copy) $(basename "$dst")"
+    return
   fi
+  rm -rf "$dst"
+  mkdir -p "$dst"
+  cp -a "$src"/. "$dst"/
+  log "  (copy) $(basename "$dst")"
+}
 
-  if [ ! -d "$target" ]; then
-    if [ "$FORCE" -eq 1 ]; then
-      log "  creating missing target: $target"
-      if [ "$DRY_RUN" -eq 0 ]; then
-        mkdir -p "$target"
-      fi
-    else
-      log "  skip (does not exist, use --force to create): $target"
-      return
-    fi
+clean_one() { # target_dir name -> remove skill dir
+  local target_dir="$1" name="$2"
+  if [ "$env_kind" = "dry" ]; then
+    log "  (clean) $name"
+    return
   fi
+  rm -rf "$target_dir/$name"
+  log "  (clean) $name"
+}
 
-  local synced=0 cleaned=0
-
-  # 1) Copy every source skill (and keep stale-skill list for cleaning).
-  local skill
-  for skill in "${!SKILLS[@]}"; do
-    local src="${SKILLS[$skill]}"
-    local dst="${target}/${skill}"
-    if [ -f "$src/SKILL.md" ] && [ ! -L "$src" ]; then
-      mkdir -p "$dst"
-      if ! cp -a "$src"/. "$dst"/ > /dev/null 2>&1 || ! diff -qr "$src" "$dst" > /dev/null 2>&1; then
-        # Cheap correctness: sync then force-reconcile once.
-        if [ "$DRY_RUN" -eq 0 ]; then
-          rm -rf "$dst"
-          mkdir -p "$dst"
-          cp -a "$src"/. "$dst"/
+# ---------------------------------------------------------------------------
+# Stage 1: copy all source skills into every target.
+# ---------------------------------------------------------------------------
+sync_copy_stage() {
+  local t abs
+  for t in "${TARGETS[@]}"; do
+    abs="$(abs_target "$t")"
+    if [ ! -d "$abs" ]; then
+      if [ "$FORCE" -eq 1 ]; then
+        if [ "$env_kind" = "dry" ]; then
+          log "  (mkdir) $t"
+        else
+          mkdir -p "$abs"
+          log "  (mkdir) $t"
         fi
-        log "  (copy) $skill"
-      elif [ "$DRY_RUN" -eq 0 ]; then
-        # already identical, report as unchanged unless asked
-        :
       else
-        log "  (copy) $skill (dry-run)"
-      fi
-      synced=$((synced + 1))
-    fi
-  done
-
-  # 2) Remove stale skills (present in target but gone from source),
-  #    EXCEPT skills preserved per-target (see PRESERVE).
-  local preserved="${PRESERVE[$rel_key]:-}"
-  local existing
-  for existing in "$target"/*/; do
-    [ -d "$existing" ] || continue
-    local name
-    name="$(basename "$existing")"
-    if [ -z "${SKILLS[$name]:-}" ]; then
-      # Skip if listed as preserve for this target.
-      if [[ " $preserved " == *" $name "* ]]; then
-        log "  (preserve) $name"
+        log "  skip (does not exist, use --force to create): $t"
         continue
       fi
-      if [ "$DRY_RUN" -eq 0 ]; then
-        log "  (clean) $name"
-        rm -rf "$existing"
-        cleaned=$((cleaned + 1))
-      else
-        log "  (clean) $name (dry-run)"
-        cleaned=$((cleaned + 1))
-      fi
     fi
+    local skill
+    for skill in "${!SKILLS[@]}"; do
+      copy_one "${SOURCE_DIR}/${skill}" "${abs}/${skill}"
+    done
   done
+}
 
-  log "  => $target: synced ${synced} skill(s), cleaned ${cleaned}"
+# ---------------------------------------------------------------------------
+# Stage 2: detect conflicts (target-only skills that are not preserved).
+# ---------------------------------------------------------------------------
+declare -a CONFLICTS_PATHS=()   # "target_abs|skill"
+gather_conflicts() {
+  CONFLICTS_PATHS=()
+  local t abs preserved existing name
+  for t in "${TARGETS[@]}"; do
+    abs="$(abs_target "$t")"
+    [ -d "$abs" ] || continue
+    preserved="${PRESERVE[$t]:-}"
+    for existing in "$abs"/*/; do
+      [ -d "$existing" ] || continue
+      name="$(basename "$existing")"
+      if [ -z "${SKILLS[$name]:-}" ]; then
+        if [[ " $preserved " == *" $name "* ]]; then
+          log "  (preserve) $t/$name"
+          continue
+        fi
+        CONFLICTS_PATHS+=("${abs}|${name}")
+      fi
+    done
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Stage 3: decide what to do with conflicts, then execute.
+# ---------------------------------------------------------------------------
+resolve_conflicts() {
+  local decision="cancel"
+  if [ "${#CONFLICTS_PATHS[@]}" -gt 0 ]; then
+    if [ "$YES" -eq 1 ]; then
+      decision="overwrite"
+    elif is_tty; then
+      echo
+      echo "Conflicts detected: skills that exist in a target but not in the shared source:"
+      local entry abs name
+      for entry in "${CONFLICTS_PATHS[@]}"; do
+        abs="${entry%%|*}"
+        name="${entry##*|}"
+        echo "   - ${abs}  ::  ${name}"
+      done
+      echo
+      PS3="Choose one action for ALL conflicts: "
+      select decision in overwrite absorb cancel; do
+        if [ -n "$decision" ]; then
+          break
+        fi
+        echo "Invalid choice, try again."
+      done
+      echo "Decision: $decision"
+    else
+      echo "No TTY session; NOT deleting conflicts. Run with --yes to overwrite."
+      decision="cancel"
+    fi
+  fi
+
+  case "$decision" in
+    overwrite)
+      local entry abs name
+      for entry in "${CONFLICTS_PATHS[@]}"; do
+        abs="${entry%%|*}"
+        name="${entry##*|}"
+        clean_one "$abs" "$name"
+      done
+      ;;
+    absorb)
+      # Copy each conflicting skill into the source (= new authority),
+      # then sync it to every target.
+      local entry abs name src
+      for entry in "${CONFLICTS_PATHS[@]}"; do
+        abs="${entry%%|*}"
+        name="${entry##*|}"
+        src="${abs}/${name}"
+        if [ ! -d "$src" ]; then
+          continue
+        fi
+        if [ "$env_kind" = "dry" ]; then
+          log "  (absorb) $name -> .agents/skills/$name"
+          continue
+        fi
+        if [ -d "${SOURCE_DIR}/${name}" ]; then
+          rm -rf "${SOURCE_DIR}/${name}"
+        fi
+        mkdir -p "${SOURCE_DIR}/${name}"
+        cp -a "$src"/. "${SOURCE_DIR}/${name}/"
+        SKILLS["$name"]="${SOURCE_DIR}/${name}"
+        log "  (absorb) $name -> .agents/skills/$name"
+      done
+      # Now distribute every absorbed skill to all targets.
+      local t abs skill
+      for t in "${TARGETS[@]}"; do
+        abs="$(abs_target "$t")"
+        [ -d "$abs" ] || continue
+        for skill in "${!SKILLS[@]}"; do
+          copy_one "${SOURCE_DIR}/${skill}" "${abs}/${skill}"
+        done
+      done
+      ;;
+    *)
+      log "  (cancel) leaving ${#CONFLICTS_PATHS[@]} conflict(s) untouched"
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
 log "Skill sync from: $SOURCE_DIR"
-for t in "${TARGETS[@]}"; do
-  sync_target "$t"
-done
+sync_copy_stage
+gather_conflicts
+resolve_conflicts
 log "Done."
