@@ -1,0 +1,4 @@
+interface:
+  display_name: "ACECode Release"
+  short_description: "Release ACECode or a Windows prerelease validation package."
+  default_prompt: "Use /acecode-release to publish a stable ACECode release or a Jenkins Green Windows prerelease validation package."
