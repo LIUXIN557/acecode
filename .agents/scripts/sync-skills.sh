@@ -16,9 +16,10 @@
 #     overwrite  -> delete the conflicting skills from that target
 #     absorb     -> copy the conflicting skill into .agents/skills (new
 #                   authority), then distribute it to every target
-#     cancel     -> do nothing, leave everything untouched (default)
+#     skip       -> do nothing, leave the conflicting skills untouched
+#                   (default)
 #
-# In a non-interactive environment (no TTY) the default is "cancel", so it
+# In a non-interactive environment (no TTY) the default is "skip", so it
 # is safe to run in CI. Pass --yes to force "overwrite" without prompting.
 #
 # Usage:
@@ -192,7 +193,7 @@ gather_conflicts() {
 # Stage 3: decide what to do with conflicts, then execute.
 # ---------------------------------------------------------------------------
 resolve_conflicts() {
-  local decision="cancel"
+  local decision="skip"
   if [ "${#CONFLICTS_PATHS[@]}" -gt 0 ]; then
     if [ "$YES" -eq 1 ]; then
       decision="overwrite"
@@ -207,7 +208,7 @@ resolve_conflicts() {
       done
       echo
       PS3="Choose one action for ALL conflicts: "
-      select decision in overwrite absorb cancel; do
+      select decision in overwrite absorb skip; do
         if [ -n "$decision" ]; then
           break
         fi
@@ -216,7 +217,7 @@ resolve_conflicts() {
       echo "Decision: $decision"
     else
       echo "No TTY session; NOT deleting conflicts. Run with --yes to overwrite."
-      decision="cancel"
+      decision="skip"
     fi
   fi
 
@@ -263,7 +264,7 @@ resolve_conflicts() {
       done
       ;;
     *)
-      log "  (cancel) leaving ${#CONFLICTS_PATHS[@]} conflict(s) untouched"
+      log "  (skip) leaving ${#CONFLICTS_PATHS[@]} conflict(s) untouched"
       ;;
   esac
 }
